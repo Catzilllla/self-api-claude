@@ -31,10 +31,10 @@ HTTP API поверх Claude Code CLI (`claude -p`) на своём VPS. Вы о
 curl -fsSL https://claude.ai/install.sh | bash
 claude            # залогиниться один раз
 
-# окружение и код
+# окружение и код (сервис запускается прямо из клона)
+git clone https://github.com/Catzilllla/self-api-claude.git ~/self-api-claude
 sudo apt install -y python3-venv
-python3 -m venv ~/venv && ~/venv/bin/pip install -r requirements.txt
-cp server.py ~/server.py
+python3 -m venv ~/venv && ~/venv/bin/pip install -r ~/self-api-claude/requirements.txt
 
 # токен и сервис (root)
 sudo sh -c 'echo "WRAPPER_TOKEN=$(openssl rand -hex 32)" > /etc/claude-api.env && chmod 600 /etc/claude-api.env'
@@ -46,6 +46,8 @@ sudo cp deploy/Caddyfile /etc/caddy/Caddyfile && sudo systemctl reload caddy
 ```
 
 Сервис слушает только `127.0.0.1:8787`, наружу его отдаёт Caddy на 443. Для домена нужна A/AAAA-запись на VPS и открытые порты 80 и 443.
+
+Обновление: `git pull` в `~/self-api-claude`, затем `sudo systemctl restart claude-api`.
 
 ## Быстрый пример
 

@@ -483,7 +483,7 @@ console.log((await getTask(task.id)).result);
 
 | Путь | Что там |
 | --- | --- |
-| `/home/claude/server.py` | Код обёртки; `server.py.bak-sync` — версия без фоновых задач |
+| `/home/claude/self-api-claude/` | Клон репозитория; сервис запускается отсюда, обновление — `git pull` и перезапуск |
 | `/home/claude/venv/` | Python-окружение с FastAPI и uvicorn |
 | `/home/claude/work/<subdir>/` | Рабочие папки задач, файлы агента |
 | `/home/claude/tasks/tasks.db` | База задач (SQLite) |
@@ -500,7 +500,7 @@ console.log((await getTask(task.id)).result);
 | `CLAUDE_BIN` | `claude` | Путь к CLI; для systemd нужен `/home/claude/.local/bin/claude` |
 | `MAX_CONCURRENCY` | 3 | Сколько CLI-процессов работает одновременно (общий лимит синхронных запросов и задач) |
 | `WORKDIR` | `./work` | Корень рабочих папок |
-| `TASKS_DIR` | `./tasks` | База и логи задач; должна быть вне `WORKDIR` |
+| `TASKS_DIR` | `./tasks` | База и логи задач; должна быть вне `WORKDIR`; в юните задано `/home/claude/tasks` |
 | `DEFAULT_MODEL` | `sonnet` | Модель, если клиент не указал |
 | `DEFAULT_TOOLS` | пусто | Инструменты, если клиент не указал; пусто = только текст |
 | `REQUEST_TIMEOUT` | 600 | Секунд на синхронный запрос |
@@ -520,7 +520,7 @@ ExecStart=/home/claude/venv/bin/uvicorn server:app --host 127.0.0.1 --port 8787 
 sudo systemctl status claude-api            # работает ли обёртка
 sudo journalctl -u claude-api -f            # лог обёртки вживую
 sudo journalctl -u caddy -n 50              # лог Caddy (сертификаты, ошибки прокси)
-sudo systemctl restart claude-api           # перезапуск после правки server.py
+sudo systemctl restart claude-api           # перезапуск после git pull
 sudo -u claude claude -p "ping" --model haiku   # жива ли авторизация CLI
 du -sh /home/claude/tasks /home/claude/work # сколько занимают логи и файлы
 ```
