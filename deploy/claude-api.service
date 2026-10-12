@@ -1,0 +1,18 @@
+[Unit]
+Description=Claude CLI API wrapper
+After=network.target
+
+[Service]
+User=claude
+WorkingDirectory=/home/claude
+Environment=HOME=/home/claude
+EnvironmentFile=/etc/claude-api.env
+Environment=CLAUDE_BIN=/home/claude/.local/bin/claude
+Environment=WORKDIR=/home/claude/work
+Environment=MAX_CONCURRENCY=3
+Environment=DEFAULT_MODEL=sonnet
+ExecStart=/home/claude/venv/bin/uvicorn server:app --host 127.0.0.1 --port 8787 --timeout-graceful-shutdown 5
+Restart=always
+
+[Install]
+WantedBy=multi-user.target

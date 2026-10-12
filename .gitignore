@@ -218,3 +218,10 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# self-api-claude runtime data and secrets
+work/
+tasks/
+*.env
+!deploy/*.env.example
+*.bak*
