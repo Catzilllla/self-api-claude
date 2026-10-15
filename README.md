@@ -18,7 +18,7 @@ HTTP API поверх агентных CLI на своём VPS: Claude Code (`cl
 | --- | --- |
 | `server.py` | Сервер на FastAPI |
 | `engines.py` | Запуск Claude Code и Codex, разбор их событий |
-| `requirements.txt` | Зависимости Python |
+| `pyproject.toml`, `uv.lock` | Зависимости Python для [uv](https://docs.astral.sh/uv/) |
 | `deploy/claude-api.service` | systemd-юнит |
 | `deploy/claude-api.env.example` | Шаблон файла с токеном |
 | `deploy/Caddyfile` | HTTPS-прокси через Caddy |
@@ -37,8 +37,8 @@ codex login
 
 # окружение и код (сервис запускается прямо из клона)
 git clone https://github.com/Catzilllla/self-api-claude.git ~/self-api-claude
-sudo apt install -y python3-venv
-python3 -m venv ~/venv && ~/venv/bin/pip install -r ~/self-api-claude/requirements.txt
+curl -LsSf https://astral.sh/uv/install.sh | sh      # uv в ~/.local/bin
+cd ~/self-api-claude && uv sync --frozen              # создаёт .venv по uv.lock
 
 # токен и сервис (root)
 sudo sh -c 'echo "WRAPPER_TOKEN=$(openssl rand -hex 32)" > /etc/claude-api.env && chmod 600 /etc/claude-api.env'
@@ -51,7 +51,7 @@ sudo cp deploy/Caddyfile /etc/caddy/Caddyfile && sudo systemctl reload caddy
 
 Сервис слушает только `127.0.0.1:8787`, наружу его отдаёт Caddy на 443. Для домена нужна A/AAAA-запись на VPS и открытые порты 80 и 443.
 
-Обновление: `git pull` в `~/self-api-claude`, затем `sudo systemctl restart claude-api`.
+Обновление: `git pull && uv sync --frozen` в `~/self-api-claude`, затем `sudo systemctl restart claude-api`.
 
 ## Быстрый пример
 
