@@ -14,7 +14,7 @@ Environment=TASKS_DIR=/home/claude/tasks
 Environment=MAX_CONCURRENCY=3
 Environment=DEFAULT_MODEL=sonnet
 Environment=ENGINE=claude
-ExecStart=/home/claude/venv/bin/uvicorn server:app --host 127.0.0.1 --port 8787 --timeout-graceful-shutdown 5
+ExecStart=/home/claude/self-api-claude/.venv/bin/uvicorn server:app --host 127.0.0.1 --port 8787 --timeout-graceful-shutdown 5
 Restart=always
 
 [Install]

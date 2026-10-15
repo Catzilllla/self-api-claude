@@ -510,8 +510,8 @@ console.log((await getTask(task.id)).result);
 
 | Путь | Что там |
 | --- | --- |
-| `/home/claude/self-api-claude/` | Клон репозитория; сервис запускается отсюда, обновление — `git pull` и перезапуск |
-| `/home/claude/venv/` | Python-окружение с FastAPI и uvicorn |
+| `/home/claude/self-api-claude/` | Клон репозитория; сервис запускается отсюда, обновление — `git pull && uv sync --frozen` и перезапуск |
+| `/home/claude/self-api-claude/.venv/` | Python-окружение с FastAPI и uvicorn; создаёт `uv sync` |
 | `/home/claude/work/<subdir>/` | Рабочие папки задач, файлы агента |
 | `/home/claude/tasks/tasks.db` | База задач (SQLite) |
 | `/home/claude/tasks/<id>.jsonl`, `<id>.stderr` | Лог событий и stderr каждой задачи |
@@ -542,7 +542,7 @@ console.log((await getTask(task.id)).result);
 В `ExecStart` нужен флаг `--timeout-graceful-shutdown 5`. Без него uvicorn при остановке ждёт, пока клиенты сами закроют `/stream`, и `systemctl restart` висит до 90 секунд:
 
 ```ini
-ExecStart=/home/claude/venv/bin/uvicorn server:app --host 127.0.0.1 --port 8787 --timeout-graceful-shutdown 5
+ExecStart=/home/claude/self-api-claude/.venv/bin/uvicorn server:app --host 127.0.0.1 --port 8787 --timeout-graceful-shutdown 5
 ```
 
 ### Повседневные команды
@@ -551,7 +551,7 @@ ExecStart=/home/claude/venv/bin/uvicorn server:app --host 127.0.0.1 --port 8787 
 sudo systemctl status claude-api            # работает ли обёртка
 sudo journalctl -u claude-api -f            # лог обёртки вживую
 sudo journalctl -u caddy -n 50              # лог Caddy (сертификаты, ошибки прокси)
-sudo systemctl restart claude-api           # перезапуск после git pull
+sudo systemctl restart claude-api           # перезапуск после git pull и uv sync
 sudo -u claude claude -p "ping" --model haiku   # жива ли авторизация Claude Code
 sudo -u claude -i codex login status           # жива ли авторизация Codex
 du -sh /home/claude/tasks /home/claude/work # сколько занимают логи и файлы
