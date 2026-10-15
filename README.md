@@ -1,9 +1,10 @@
 # self-api-claude
 
-HTTP API поверх Claude Code CLI (`claude -p`) на своём VPS. Вы отправляете запрос на сервер, сервер вызывает уже залогиненный CLI и возвращает ответ. API-ключ Anthropic не нужен: работает подписка, под которой залогинен CLI.
+HTTP API поверх агентных CLI на своём VPS: Claude Code (`claude -p`) и Codex (`codex exec`). Вы отправляете запрос на сервер, сервер вызывает уже залогиненный CLI и возвращает ответ. API-ключи не нужны: работают подписки, под которыми залогинены CLI.
 
 ## Возможности
 
+- **Два движка:** поле `engine` (`claude` или `codex`) в любом запросе; по умолчанию `ENGINE`. Продолжение задачи всегда идёт на движке родителя.
 - **Синхронные запросы:** `POST /v1/run` и OpenAI-совместимый `POST /v1/chat/completions`.
 - **Фоновые задачи:** поставили задачу, отключились и вернулись позже за ходом работы или результатом (`/v1/tasks`).
 - **Живой прогресс:** вызовы инструментов, вывод, текст агента — через `/events` (опрос) или `/stream` (SSE).
@@ -16,6 +17,7 @@ HTTP API поверх Claude Code CLI (`claude -p`) на своём VPS. Вы о
 | Путь | Что это |
 | --- | --- |
 | `server.py` | Сервер на FastAPI |
+| `engines.py` | Запуск Claude Code и Codex, разбор их событий |
 | `requirements.txt` | Зависимости Python |
 | `deploy/claude-api.service` | systemd-юнит |
 | `deploy/claude-api.env.example` | Шаблон файла с токеном |
@@ -30,6 +32,8 @@ HTTP API поверх Claude Code CLI (`claude -p`) на своём VPS. Вы о
 # под пользователем claude: CLI и вход в аккаунт
 curl -fsSL https://claude.ai/install.sh | bash
 claude            # залогиниться один раз
+# Codex (необязательно): установить в ~/.local/bin и войти
+codex login
 
 # окружение и код (сервис запускается прямо из клона)
 git clone https://github.com/Catzilllla/self-api-claude.git ~/self-api-claude
@@ -63,8 +67,10 @@ curl -N -H "Authorization: Bearer $T" $U/v1/tasks/ID/stream   # смотреть
 curl    -H "Authorization: Bearer $T" $U/v1/tasks/ID          # результат
 ```
 
+Та же задача на Codex: добавьте `"engine":"codex"`. Список движков и моделей: `GET /v1/engines`.
+
 Подробности — в [docs/MANUAL.md](docs/MANUAL.md).
 
 ## Безопасность
 
-Токен даёт доступ к агенту на сервере. С `allowed_tools: "Bash"` агент выполняет любые команды от пользователя `claude`. Не публикуйте токен и не встраивайте его во фронтенд.
+Токен даёт доступ к агенту на сервере. С `allowed_tools: "Bash"` агент выполняет любые команды от пользователя `claude`, у Codex это режим без песочницы. Не публикуйте токен и не встраивайте его во фронтенд.

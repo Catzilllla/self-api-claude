@@ -1,10 +1,12 @@
 # Claude CLI API — руководство
 
-12 октября 2026
+15 октября 2026
 
 ## Введение
 
-Сервер `https://api.config-app.com` принимает HTTP-запросы и передаёт их в Claude Code CLI, залогиненный на VPS через подписку. Ответ возвращается в JSON. API-ключ Anthropic не нужен: CLI работает от пользователя `claude` под его учётной записью.
+Сервер `https://api.config-app.com` принимает HTTP-запросы и передаёт их агентному CLI, залогиненному на VPS через подписку. Ответ возвращается в JSON. API-ключи не нужны: CLI работают от пользователя `claude` под его учётными записями.
+
+**Два движка.** Поле `engine` в запросе выбирает CLI: `claude` — Claude Code, `codex` — Codex от OpenAI. Без поля работает движок по умолчанию (`ENGINE`, сейчас `claude`). Ответы, задачи и события выглядят одинаково для обоих, различия — в разделе «Движки» справочника.
 
 **Авторизация.** Каждый запрос, кроме `/health`, передаёт заголовок `Authorization: Bearer <WRAPPER_TOKEN>`. Без токена или с неверным токеном сервер отвечает `401`. Токен лежит в systemd-юните `claude-api` (или в `/etc/claude-api.env`, если вы вынесли его туда).
 
@@ -133,7 +135,7 @@ curl -X DELETE -H "Authorization: Bearer $T" $U/v1/tasks/ID        # удали�
 
 ### Подключение из OpenAI-совместимых программ
 
-Программа с поддержкой «своего OpenAI-сервера» подключается с такими настройками: Base URL `https://api.config-app.com/v1`, API key — ваш токен, модель `sonnet`, `opus` или `haiku`. Стриминг ответа не поддерживается, выключите его в настройках программы.
+Программа с поддержкой «своего OpenAI-сервера» подключается с такими настройками: Base URL `https://api.config-app.com/v1`, API key — ваш токен, модель из `GET /v1/models`: `sonnet`, `opus`, `haiku` для Claude или модель Codex, например `gpt-6-luna`. Движок выбирается по названию модели. Стриминг ответа не поддерживается, выключите его в настройках программы.
 
 ## Справочник API
 
@@ -146,7 +148,8 @@ curl -X DELETE -H "Authorization: Bearer $T" $U/v1/tasks/ID        # удали�
 | GET | `/health` | Проверка живости, без токена | 200 |
 | POST | `/v1/run` | Синхронный запуск, таймаут `REQUEST_TIMEOUT` (600 с) | 200 |
 | POST | `/v1/chat/completions` | OpenAI-совместимый чат без стриминга | 200 |
-| GET | `/v1/models` | Список моделей для OpenAI-клиентов | 200 |
+| GET | `/v1/models` | Список моделей всех движков для OpenAI-клиентов, у каждой поле `engine` | 200 |
+| GET | `/v1/engines` | Движки: установлен ли, модели, модель по умолчанию | 200 |
 | POST | `/v1/tasks` | Создать фоновую задачу | 202 |
 | GET | `/v1/tasks?status=&limit=` | Список задач, новые первыми; `limit` от 1 до 500, по умолчанию 50 | 200 |
 | GET | `/v1/tasks/{id}` | Полное описание задачи | 200 |
@@ -163,16 +166,17 @@ curl -X DELETE -H "Authorization: Bearer $T" $U/v1/tasks/ID        # удали�
 | Поле | Тип | Обязательное | Описание |
 | --- | --- | --- | --- |
 | `prompt` | string | да | Текст задачи |
+| `engine` | string | нет | `claude` или `codex`; по умолчанию `ENGINE` |
 | `title` | string | нет | Название для списка, только `/v1/tasks` |
-| `model` | string | нет | `sonnet`, `opus`, `haiku` или полный id модели; по умолчанию `DEFAULT_MODEL` |
+| `model` | string | нет | Claude: `sonnet`, `opus`, `haiku` или полный id, по умолчанию `DEFAULT_MODEL`. Codex: модель из `/v1/engines`, по умолчанию `CODEX_DEFAULT_MODEL` |
 | `allowed_tools` | string | нет | Инструменты через запятую, например `Bash,Read,Write`; `""` — только текст; по умолчанию `DEFAULT_TOOLS` |
 | `subdir` | string | нет | Рабочая папка внутри `WORKDIR`, символы `A-Z a-z 0-9 _ -`, до 64 |
 | `session_id` | string | нет | Продолжить существующую сессию CLI |
-| `system_prompt` | string | нет | Добавляется к системному промпту Claude Code |
+| `system_prompt` | string | нет | Дополнительные инструкции: у Claude добавляются к системному промпту, у Codex идут как `developer_instructions` |
 
-Для `POST /v1/tasks/{id}/continue`: обязателен `prompt`, необязательны `title`, `model`, `allowed_tools` и `system_prompt`. Не указанные поля берутся из родительской задачи, `subdir` всегда остаётся её.
+Для `POST /v1/tasks/{id}/continue`: обязателен `prompt`, необязательны `title`, `model`, `allowed_tools` и `system_prompt`. Не указанные поля берутся из родительской задачи, `subdir` и `engine` всегда остаются её: сессию продолжает только тот CLI, который её создал. Другой `engine` в запросе даёт `409`.
 
-Для `POST /v1/chat/completions`: стандартные `model` и `messages`, а также нестандартные `allowed_tools`, `subdir` и `session_id` (в OpenAI SDK передаются через `extra_body`). Сообщения `system` идут в системный промпт. Без `session_id` вся история склеивается в один промпт.
+Для `POST /v1/chat/completions`: стандартные `model` и `messages`, а также нестандартные `engine`, `allowed_tools`, `subdir` и `session_id`. Без `engine` движок выбирается по `model` (в OpenAI SDK передаются через `extra_body`). Сообщения `system` идут в системный промпт. Без `session_id` вся история склеивается в один промпт.
 
 ### Объект задачи
 
@@ -180,12 +184,12 @@ curl -X DELETE -H "Authorization: Bearer $T" $U/v1/tasks/ID        # удали�
 | --- | --- |
 | `id` | 32 hex-символа |
 | `status` | `queued`, `running`, `done`, `failed` или `cancelled` |
-| `title`, `model`, `subdir` | Как в запросе |
+| `title`, `engine`, `model`, `subdir` | Как в запросе; `model` — фактическая модель с учётом умолчания |
 | `parent_id` | `id` задачи, от которой сделан `/continue`, иначе `null` |
 | `session_id` | Сессия CLI; появляется в первые секунды работы |
 | `result` | Итоговый ответ агента (когда `done`) |
 | `error` | Причина (когда `failed`) |
-| `cost_usd`, `num_turns`, `duration_ms`, `usage` | Стоимость в долларах по оценке CLI, число ходов, длительность, токены |
+| `cost_usd`, `num_turns`, `duration_ms`, `usage` | Стоимость в долларах по оценке CLI (у Codex всегда `null`), число ходов (у Codex — вызовы инструментов + 1), длительность, токены |
 | `created_at`, `started_at`, `finished_at` | Время создания, запуска и завершения |
 | `prompt`, `allowed_tools` | Только в `GET /v1/tasks/{id}` |
 | `prompt_preview`, `result_preview` | Только в списке: первые 200 символов |
@@ -203,9 +207,32 @@ curl -X DELETE -H "Authorization: Bearer $T" $U/v1/tasks/ID        # удали�
 | `tool_result` | `is_error`, `output` | Результат инструмента, до 1000 символов |
 | `result` | `is_error`, `result`, `cost_usd`, `num_turns`, `duration_ms` | Работа CLI закончена |
 
-С `raw=1` приходят исходные события CLI (`stream-json`) без обрезки, с добавленным `seq`.
+С `raw=1` приходят исходные события CLI без обрезки, с добавленным `seq`: у Claude — `stream-json`, у Codex — события `codex exec --json` (`thread.started`, `item.started`, `item.completed`, `turn.completed`, `turn.failed`).
+
+У Codex событие `result` приходит без текста (`result: null`) и с полем `usage`: итоговый ответ — это последнее событие `text`, а также поле `result` задачи. Команды Codex показываются как `tool_use` с `tool: "Bash"`, правки файлов — `Edit`, поиск — `WebSearch`.
 
 `/stream` отдаёт те же события в формате SSE: `id: <seq>` и `data: <json>`. В конце приходит `event: end` с кратким описанием задачи, после чего сервер закрывает поток. Пока новых событий нет, каждые 15 секунд приходит комментарий `: keepalive`.
+
+### Движки
+
+| | Claude (`claude`) | Codex (`codex`) |
+| --- | --- | --- |
+| Модели | `sonnet`, `opus`, `haiku` | список аккаунта из `GET /v1/engines` |
+| Ограничение агента | точный список инструментов | песочница ОС, см. ниже |
+| `cost_usd` | оценка CLI | `null`, только токены в `usage` |
+| Продолжение сессии | да | да |
+
+У Codex нет списка инструментов, поэтому `allowed_tools` в именах Claude переводится в режим песочницы:
+
+| `allowed_tools` | Режим Codex | Что может агент |
+| --- | --- | --- |
+| `""` | `read-only`, shell выключен | Только отвечать текстом |
+| `Read,Grep,Glob` | `read-only` | Читать файлы и запускать команды без записи |
+| есть `Write`, `Edit` или `Bash(<правило>)` | `workspace-write` | Писать в рабочую папку и `/tmp`, без сети |
+| есть `Bash` без правила | `danger-full-access` | Любые команды без песочницы, как `Bash` у Claude |
+| есть `WebSearch` или `WebFetch` | + встроенный веб-поиск | Искать в интернете |
+
+Режим Codex можно указать и напрямую: `"allowed_tools": "workspace-write"` или `"workspace-write,web"`. Коннекторы ChatGPT, плагины, браузер и управление компьютером в Codex выключены всегда, личные настройки `~/.codex/config.toml` не применяются.
 
 ### Ошибки
 
@@ -213,10 +240,10 @@ curl -X DELETE -H "Authorization: Bearer $T" $U/v1/tasks/ID        # удали�
 
 | Код | Когда |
 | --- | --- |
-| 400 | Неверный `model`, `allowed_tools`, `subdir` или `session_id`; значения, начинающиеся с `-`, отклоняются; `stream: true` в chat completions |
+| 400 | Неизвестный или не установленный `engine`; неверный `model`, `allowed_tools`, `subdir` или `session_id`; значения, начинающиеся с `-`, отклоняются; `stream: true` в chat completions |
 | 401 | Нет токена или он неверный |
 | 404 | Задача не найдена |
-| 409 | `cancel` уже завершённой задачи; `continue` или `DELETE` ещё активной; `continue` задачи без сессии |
+| 409 | `cancel` уже завершённой задачи; `continue` или `DELETE` ещё активной; `continue` задачи без сессии или с другим `engine` |
 | 422 | Неверная структура JSON, например нет `prompt` |
 | 502 | CLI завершился с ошибкой (синхронные эндпоинты) |
 | 504 | Превышен `REQUEST_TIMEOUT` (синхронные эндпоинты) |
@@ -477,7 +504,7 @@ console.log((await getTask(task.id)).result);
 
 ## Администрирование и ограничения
 
-Запрос проходит цепочку: клиент → Caddy (HTTPS, порт 443) → `uvicorn server:app` на `127.0.0.1:8787` → `claude -p` от пользователя `claude`. Снаружи доступны только порты 80 и 443.
+Запрос проходит цепочку: клиент → Caddy (HTTPS, порт 443) → `uvicorn server:app` на `127.0.0.1:8787` → `claude -p` или `codex exec` от пользователя `claude`. Снаружи доступны только порты 80 и 443.
 
 ### Файлы на VPS
 
@@ -488,7 +515,8 @@ console.log((await getTask(task.id)).result);
 | `/home/claude/work/<subdir>/` | Рабочие папки задач, файлы агента |
 | `/home/claude/tasks/tasks.db` | База задач (SQLite) |
 | `/home/claude/tasks/<id>.jsonl`, `<id>.stderr` | Лог событий и stderr каждой задачи |
-| `/home/claude/.claude/.credentials.json` | Авторизация CLI по подписке |
+| `/home/claude/.claude/.credentials.json` | Авторизация Claude Code по подписке |
+| `/home/claude/.codex/auth.json` | Авторизация Codex (ChatGPT); там же сессии Codex в `sessions/` |
 | `/etc/systemd/system/claude-api.service` | Сервис и его переменные окружения |
 | `/etc/caddy/Caddyfile` | HTTPS-прокси для `api.config-app.com` |
 
@@ -497,11 +525,14 @@ console.log((await getTask(task.id)).result);
 | Переменная | По умолчанию | Назначение |
 | --- | --- | --- |
 | `WRAPPER_TOKEN` | — (обязательна) | Bearer-токен клиентов |
-| `CLAUDE_BIN` | `claude` | Путь к CLI; для systemd нужен `/home/claude/.local/bin/claude` |
+| `CLAUDE_BIN` | `claude` | Путь к Claude Code; для systemd нужен `/home/claude/.local/bin/claude` |
+| `CODEX_BIN` | `codex` | Путь к Codex; для systemd нужен `/home/claude/.local/bin/codex` |
+| `ENGINE` | `claude` | Движок, если клиент не указал |
 | `MAX_CONCURRENCY` | 3 | Сколько CLI-процессов работает одновременно (общий лимит синхронных запросов и задач) |
 | `WORKDIR` | `./work` | Корень рабочих папок |
 | `TASKS_DIR` | `./tasks` | База и логи задач; должна быть вне `WORKDIR`; в юните задано `/home/claude/tasks` |
-| `DEFAULT_MODEL` | `sonnet` | Модель, если клиент не указал |
+| `DEFAULT_MODEL` | `sonnet` | Модель Claude, если клиент не указал |
+| `CODEX_DEFAULT_MODEL` | первая модель аккаунта | Модель Codex, если клиент не указал |
 | `DEFAULT_TOOLS` | пусто | Инструменты, если клиент не указал; пусто = только текст |
 | `REQUEST_TIMEOUT` | 600 | Секунд на синхронный запрос |
 | `TASK_TIMEOUT` | 3600 | Секунд на фоновую задачу |
@@ -521,23 +552,25 @@ sudo systemctl status claude-api            # работает ли обёртк
 sudo journalctl -u claude-api -f            # лог обёртки вживую
 sudo journalctl -u caddy -n 50              # лог Caddy (сертификаты, ошибки прокси)
 sudo systemctl restart claude-api           # перезапуск после git pull
-sudo -u claude claude -p "ping" --model haiku   # жива ли авторизация CLI
+sudo -u claude claude -p "ping" --model haiku   # жива ли авторизация Claude Code
+sudo -u claude -i codex login status           # жива ли авторизация Codex
 du -sh /home/claude/tasks /home/claude/work # сколько занимают логи и файлы
 ```
 
-Если задачи падают с ошибкой авторизации, зайдите под пользователем `claude`, запустите `claude` и залогиньтесь заново. Перезапускать обёртку после этого не нужно.
+Если задачи падают с ошибкой авторизации, зайдите под пользователем `claude` и залогиньтесь заново: `claude` для Claude Code, `codex login` для Codex. Перезапускать обёртку после этого не нужно.
 
 ### Ограничения
 
 - **Перезапуск обрывает работающие задачи.** Они получают `failed` и продолжаются через `/continue`. Задачи из очереди запускаются заново сами. Перед перезапуском проверьте `GET /v1/tasks?status=running`.
 - **Один экземпляр.** Второй процесс с тем же `TASKS_DIR` не запустится. Запускайте uvicorn без `--workers`.
-- **Лимиты подписки.** Все задачи тратят один аккаунт с пятичасовым и недельным окнами. Когда лимит исчерпан, задачи завершаются с `failed`. `cost_usd` — оценка CLI, а не сумма к оплате.
+- **Лимиты подписки.** Задачи каждого движка тратят свой аккаунт (Claude или ChatGPT) с его окнами лимитов. Когда лимит исчерпан, задачи завершаются с `failed`. `cost_usd` — оценка CLI, а не сумма к оплате.
 - **Размеры.** Тело запроса не больше 10 МБ (лимит в Caddyfile). Одно событие CLI не больше 64 МБ.
 - **Нет стриминга в `/v1/chat/completions`.** Для живого вывода используйте задачи и `/stream`.
 
 ### Безопасность
 
-- Токен равносилен доступу к агенту на сервере. С `allowed_tools: "Bash"` агент выполняет любые команды от пользователя `claude`, в том числе за пределами `subdir`.
+- Токен равносилен доступу к агенту на сервере. С `allowed_tools: "Bash"` агент выполняет любые команды от пользователя `claude`, в том числе за пределами `subdir`; у Codex это режим `danger-full-access`.
+- Песочница Codex `read-only` и `workspace-write` ограничивает запись, но не чтение: агент может прочитать любой файл, доступный пользователю `claude`, включая файлы авторизации CLI.
 - Храните токен в `/etc/claude-api.env` с правами `600` (строка `EnvironmentFile=` в юните), а не в самом юните: его читают все пользователи.
 - Чтобы сменить токен, сгенерируйте новый (`openssl rand -hex 32`), запишите его и перезапустите сервис. Старый токен перестанет работать сразу.
 - Значения `model`, `allowed_tools`, `subdir` и `session_id` проверяются, так что клиент не может подсунуть CLI лишние флаги. Промпт передаётся через stdin и не виден в `ps`.

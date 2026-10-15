@@ -1,9 +1,14 @@
-"""HTTP wrapper over `claude -p` (headless Claude Code CLI).
+"""HTTP wrapper over agent CLIs: Claude Code (`claude -p`) and Codex (`codex exec`).
+
+Every request picks an engine ("claude" or "codex", default ENGINE); a
+continued task always stays on its parent's engine. See engines.py for how
+each CLI is driven and how allowed_tools maps onto Codex sandboxes.
 
 Endpoints:
-  POST /v1/run                  — native, synchronous: prompt in, CLI JSON result out
+  POST /v1/run                  — native, synchronous: prompt in, final result out
   POST /v1/chat/completions     — OpenAI-compatible (non-streaming)
-  GET  /v1/models               — model list for OpenAI clients
+  GET  /v1/models               — model list for OpenAI clients, all engines
+  GET  /v1/engines              — engines, whether installed, their models and defaults
   GET  /health                  — liveness, no auth
 
 Background tasks (survive client disconnects and service restarts):
@@ -22,8 +27,11 @@ Config via env:
   WORKDIR          base dir; each request runs in WORKDIR/<subdir> (default ./work)
   TASKS_DIR        task database and event logs, outside WORKDIR (default ./tasks)
   DEFAULT_TOOLS    tools when the request doesn't specify any ("" = text only)
-  DEFAULT_MODEL    default model alias (default "sonnet")
-  CLAUDE_BIN       path to the CLI (default "claude")
+  ENGINE           engine when the request doesn't name one (default "claude")
+  DEFAULT_MODEL    default Claude model alias (default "sonnet")
+  CODEX_DEFAULT_MODEL  default Codex model (default: the account's top listed model)
+  CLAUDE_BIN       path to the Claude CLI (default "claude")
+  CODEX_BIN        path to the Codex CLI (default "codex")
   REQUEST_TIMEOUT  seconds per synchronous CLI call (default 600)
   TASK_TIMEOUT     seconds per background task (default 3600)
 """
@@ -45,18 +53,23 @@ from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
+from engines import Engine, load_engines
+
 WRAPPER_TOKEN = os.environ.get("WRAPPER_TOKEN", "")
 MAX_CONCURRENCY = int(os.environ.get("MAX_CONCURRENCY", "3"))
 WORKDIR = Path(os.environ.get("WORKDIR", "./work")).resolve()
 TASKS_DIR = Path(os.environ.get("TASKS_DIR", "./tasks")).resolve()
 DEFAULT_TOOLS = os.environ.get("DEFAULT_TOOLS", "")
-DEFAULT_MODEL = os.environ.get("DEFAULT_MODEL", "sonnet")
-CLAUDE_BIN = os.environ.get("CLAUDE_BIN", "claude")
+DEFAULT_ENGINE = os.environ.get("ENGINE", "claude")
 REQUEST_TIMEOUT = float(os.environ.get("REQUEST_TIMEOUT", "600"))
 TASK_TIMEOUT = float(os.environ.get("TASK_TIMEOUT", "3600"))
 
 if not WRAPPER_TOKEN:
     raise RuntimeError("WRAPPER_TOKEN is not set")
+
+ENGINES = load_engines()
+if DEFAULT_ENGINE not in ENGINES:
+    raise RuntimeError(f"ENGINE must be one of {', '.join(ENGINES)}")
 
 WORKDIR.mkdir(parents=True, exist_ok=True)
 TASKS_DIR.mkdir(parents=True, exist_ok=True)
@@ -88,6 +101,15 @@ def resolve_cwd(subdir: str | None) -> Path:
     return path
 
 
+def get_engine(name: str | None) -> Engine:
+    engine = ENGINES.get(name or DEFAULT_ENGINE)
+    if engine is None:
+        raise HTTPException(status_code=400, detail=f"engine must be one of {', '.join(ENGINES)}")
+    if not engine.available():
+        raise HTTPException(status_code=400, detail=f"engine {engine.name} is not installed on the server")
+    return engine
+
+
 def check_params(model: str | None, tools: str, session_id: str | None) -> None:
     if model and not MODEL_RE.match(model):
         raise HTTPException(status_code=400, detail="invalid model")
@@ -97,47 +119,23 @@ def check_params(model: str | None, tools: str, session_id: str | None) -> None:
         raise HTTPException(status_code=400, detail="invalid session_id")
 
 
-def build_args(
-    output_format: str,
-    model: str | None,
-    tools: str,
-    session_id: str | None,
-    system_prompt: str | None,
-) -> list[str]:
-    # --tools limits what exists at all; --allowedTools pre-approves the same set,
-    # since headless mode can't ask for permission interactively.
-    # "--opt=value" keeps a value that starts with "-" from being read as a flag.
-    args = [
-        CLAUDE_BIN, "-p",
-        "--output-format", output_format,
-        f"--model={model or DEFAULT_MODEL}",
-        "--tools", tools,
-        "--strict-mcp-config",
-    ]
-    if output_format == "stream-json":
-        args.append("--verbose")  # required by the CLI for stream-json in -p mode
-    if tools:
-        args += ["--allowedTools", tools]
-    if session_id:
-        args.append(f"--resume={session_id}")
-    if system_prompt:
-        args.append(f"--append-system-prompt={system_prompt}")
-    return args
-
-
-async def run_claude(
+async def run_sync(
+    engine_name: str | None,
     prompt: str,
     model: str | None,
     allowed_tools: str | None,
     subdir: str | None,
     session_id: str | None,
     system_prompt: str | None,
-) -> dict:
+):
+    engine = get_engine(engine_name)
     tools = DEFAULT_TOOLS if allowed_tools is None else allowed_tools
     check_params(model, tools, session_id)
-    args = build_args("json", model, tools, session_id, system_prompt)
+    args = engine.build_args(model or engine.default_model, tools, session_id, system_prompt)
+    result = engine.new_result()
 
     cwd = resolve_cwd(subdir)
+    started = time.monotonic()
     async with semaphore:
         proc = await asyncio.create_subprocess_exec(
             *args,
@@ -145,25 +143,38 @@ async def run_claude(
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            limit=64 * 1024 * 1024,
         )
-        try:
+
+        async def consume() -> bytes:
             # Prompt goes via stdin: no argv length limits, not visible in `ps`.
-            stdout, stderr = await asyncio.wait_for(
-                proc.communicate(prompt.encode()), timeout=REQUEST_TIMEOUT
-            )
+            proc.stdin.write(prompt.encode())
+            await proc.stdin.drain()
+            proc.stdin.close()
+            stderr_task = asyncio.create_task(proc.stderr.read())
+            async for line in proc.stdout:
+                try:
+                    result.feed(json.loads(line))
+                except ValueError:
+                    continue
+            await proc.wait()
+            return await stderr_task
+
+        try:
+            stderr = await asyncio.wait_for(consume(), timeout=REQUEST_TIMEOUT)
         except asyncio.TimeoutError:
             proc.kill()
             await proc.wait()
-            raise HTTPException(status_code=504, detail="claude timed out")
+            raise HTTPException(status_code=504, detail=f"{engine.name} timed out")
 
-    try:
-        result = json.loads(stdout)
-    except json.JSONDecodeError:
-        detail = (stderr or stdout).decode(errors="replace")[-2000:]
-        raise HTTPException(status_code=502, detail=f"claude failed (exit {proc.returncode}): {detail}")
-    if result.get("is_error"):
-        raise HTTPException(status_code=502, detail=result.get("result") or result)
-    return result
+    if not result.finished:
+        detail = stderr.decode(errors="replace")[-2000:]
+        raise HTTPException(status_code=502, detail=f"{engine.name} failed (exit {proc.returncode}): {detail}")
+    if result.is_error:
+        raise HTTPException(status_code=502, detail=result.error)
+    if result.duration_ms is None:
+        result.duration_ms = int((time.monotonic() - started) * 1000)
+    return engine, model or engine.default_model, result
 
 
 # ---------------------------------------------------------------- background tasks
@@ -181,6 +192,7 @@ db.execute("""
         allowed_tools TEXT NOT NULL,
         subdir TEXT,
         system_prompt TEXT,
+        engine TEXT,
         parent_id TEXT,
         resume_session_id TEXT,
         session_id TEXT,
@@ -195,6 +207,8 @@ db.execute("""
         finished_at REAL
     )
 """)
+if "engine" not in {r["name"] for r in db.execute("PRAGMA table_info(tasks)")}:
+    db.execute("ALTER TABLE tasks ADD COLUMN engine TEXT")  # older databases: those tasks ran on Claude
 
 ACTIVE = ("queued", "running")
 TERMINAL = ("done", "failed", "cancelled")
@@ -227,12 +241,17 @@ def iso(ts: float | None) -> str | None:
     return datetime.fromtimestamp(ts, timezone.utc).isoformat(timespec="seconds") if ts else None
 
 
+def task_engine(t: dict) -> Engine:
+    return ENGINES[t["engine"] or "claude"]
+
+
 def task_out(t: dict, full: bool = True) -> dict:
     out = {
         "id": t["id"],
         "title": t["title"],
         "status": t["status"],
-        "model": t["model"] or DEFAULT_MODEL,
+        "engine": t["engine"] or "claude",
+        "model": t["model"] or task_engine(t).default_model,
         "subdir": t["subdir"],
         "parent_id": t["parent_id"],
         "session_id": t["session_id"],
@@ -257,48 +276,6 @@ def task_out(t: dict, full: bool = True) -> dict:
     return out
 
 
-def clip(value, limit: int = 2000) -> str:
-    text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
-    return text if len(text) <= limit else text[:limit] + f"… [+{len(text) - limit} chars]"
-
-
-def compact(ev: dict) -> list[dict]:
-    """Turn one raw stream-json event into short, human-readable progress items."""
-    kind = ev.get("type")
-    if kind == "system" and ev.get("subtype") == "init":
-        return [{"kind": "start", "model": ev.get("model"), "session_id": ev.get("session_id")}]
-    if kind == "assistant":
-        items = []
-        for part in ev.get("message", {}).get("content") or []:
-            if part.get("type") == "text":
-                items.append({"kind": "text", "text": part.get("text", "")})
-            elif part.get("type") == "tool_use":
-                items.append({"kind": "tool_use", "tool": part.get("name"), "input": clip(part.get("input"), 500)})
-            elif part.get("type") == "thinking" and part.get("thinking"):
-                items.append({"kind": "thinking", "text": clip(part["thinking"], 1000)})
-        return items
-    if kind == "user":
-        items = []
-        content = ev.get("message", {}).get("content")
-        for part in content if isinstance(content, list) else []:
-            if isinstance(part, dict) and part.get("type") == "tool_result":
-                output = part.get("content")
-                if isinstance(output, list):
-                    output = "\n".join(p.get("text", "") for p in output if isinstance(p, dict))
-                items.append({"kind": "tool_result", "is_error": bool(part.get("is_error")), "output": clip(output or "", 1000)})
-        return items
-    if kind == "result":
-        return [{
-            "kind": "result",
-            "is_error": ev.get("is_error"),
-            "result": ev.get("result"),
-            "cost_usd": ev.get("total_cost_usd"),
-            "num_turns": ev.get("num_turns"),
-            "duration_ms": ev.get("duration_ms"),
-        }]
-    return []
-
-
 def stderr_tail(task_id: str) -> str:
     try:
         return stderr_path(task_id).read_text(errors="replace")[-2000:].strip()
@@ -309,12 +286,16 @@ def stderr_tail(task_id: str) -> str:
 async def run_task(task_id: str) -> None:
     try:
         t = load_task(task_id)
-        args = build_args("stream-json", t["model"], t["allowed_tools"], t["resume_session_id"], t["system_prompt"])
+        engine = task_engine(t)
+        args = engine.build_args(t["model"] or engine.default_model, t["allowed_tools"],
+                                 t["resume_session_id"], t["system_prompt"])
+        result = engine.new_result()
         async with semaphore:
             if load_task(task_id)["status"] != "queued":  # cancelled while waiting
                 return
-            db_update(task_id, status="running", started_at=time.time())
-            final, timed_out = None, False
+            started = time.time()
+            db_update(task_id, status="running", started_at=started)
+            timed_out = False
             with open(events_path(task_id), "ab") as events, open(stderr_path(task_id), "ab") as err:
                 proc = await asyncio.create_subprocess_exec(
                     *args,
@@ -330,7 +311,6 @@ async def run_task(task_id: str) -> None:
                 proc.stdin.close()
 
                 async def consume():
-                    nonlocal final
                     async for line in proc.stdout:
                         if not line.endswith(b"\n"):
                             line += b"\n"
@@ -340,11 +320,10 @@ async def run_task(task_id: str) -> None:
                             ev = json.loads(line)
                         except ValueError:
                             continue
-                        if ev.get("type") == "system" and ev.get("subtype") == "init":
+                        result.feed(ev)
+                        if session_id := engine.session_id(ev):
                             # Saved early so a failed or interrupted task can still be continued.
-                            db_update(task_id, session_id=ev.get("session_id"))
-                        elif ev.get("type") == "result":
-                            final = ev
+                            db_update(task_id, session_id=session_id)
                     await proc.wait()
 
                 try:
@@ -357,32 +336,32 @@ async def run_task(task_id: str) -> None:
         now = time.time()
         if load_task(task_id)["status"] == "cancelled":
             pass
-        elif final and not final.get("is_error"):
+        elif result.finished and not result.is_error:
             db_update(
                 task_id,
                 status="done",
                 finished_at=now,
-                result=final.get("result", ""),
-                session_id=final.get("session_id"),
-                cost_usd=final.get("total_cost_usd"),
-                num_turns=final.get("num_turns"),
-                duration_ms=final.get("duration_ms"),
-                usage=json.dumps(final.get("usage")),
+                result=result.text,
+                session_id=result.session_id,
+                cost_usd=result.cost_usd,
+                num_turns=result.num_turns,
+                duration_ms=result.duration_ms or int((now - started) * 1000),
+                usage=json.dumps(result.usage),
             )
         else:
             if timed_out:
                 error = f"timed out after {TASK_TIMEOUT:.0f}s"
-            elif final:
-                error = final.get("result") or final.get("subtype") or "claude reported an error"
+            elif result.finished:
+                error = result.error
             else:
-                error = f"claude exited with code {proc.returncode}: {stderr_tail(task_id)}"
+                error = f"{engine.name} exited with code {proc.returncode}: {stderr_tail(task_id)}"
             db_update(
                 task_id,
                 status="failed",
                 finished_at=now,
                 error=error,
-                cost_usd=(final or {}).get("total_cost_usd"),
-                num_turns=(final or {}).get("num_turns"),
+                cost_usd=result.cost_usd,
+                num_turns=result.num_turns,
             )
     except Exception as e:  # never leave a task stuck in "running"
         db_update(task_id, status="failed", finished_at=time.time(), error=f"wrapper error: {e!r}")
@@ -396,6 +375,7 @@ def schedule(task_id: str) -> None:
 
 
 def create_task(
+    engine_name: str | None,
     prompt: str,
     title: str | None,
     model: str | None,
@@ -405,14 +385,15 @@ def create_task(
     system_prompt: str | None,
     parent_id: str | None = None,
 ) -> dict:
+    engine = get_engine(engine_name)
     tools = DEFAULT_TOOLS if allowed_tools is None else allowed_tools
     check_params(model, tools, session_id)
     resolve_cwd(subdir)  # validate now, not in the background
     task_id = uuid.uuid4().hex
     db.execute(
-        "INSERT INTO tasks (id, title, status, prompt, model, allowed_tools, subdir, system_prompt,"
-        " parent_id, resume_session_id, created_at) VALUES (?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?)",
-        (task_id, title, prompt, model, tools, subdir, system_prompt, parent_id, session_id, time.time()),
+        "INSERT INTO tasks (id, title, status, prompt, model, allowed_tools, subdir, system_prompt, engine,"
+        " parent_id, resume_session_id, created_at) VALUES (?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (task_id, title, prompt, model, tools, subdir, system_prompt, engine.name, parent_id, session_id, time.time()),
     )
     schedule(task_id)
     return task_out(load_task(task_id))
@@ -442,11 +423,12 @@ async def lifespan(_app: FastAPI):
     lock.close()
 
 
-app = FastAPI(title="Claude CLI API", lifespan=lifespan)
+app = FastAPI(title="Agent CLI API", lifespan=lifespan)
 
 
 class RunRequest(BaseModel):
     prompt: str
+    engine: str | None = None
     model: str | None = None
     allowed_tools: str | None = None
     subdir: str | None = None
@@ -456,21 +438,23 @@ class RunRequest(BaseModel):
 
 @app.get("/health")
 async def health():
-    return {"ok": True}
+    return {"ok": True, "engines": {name: e.available() for name, e in ENGINES.items()}}
 
 
 @app.post("/v1/run", dependencies=[Depends(require_token)])
 async def run(req: RunRequest):
-    result = await run_claude(
-        req.prompt, req.model, req.allowed_tools, req.subdir, req.session_id, req.system_prompt
+    engine, model, result = await run_sync(
+        req.engine, req.prompt, req.model, req.allowed_tools, req.subdir, req.session_id, req.system_prompt
     )
     return {
-        "result": result.get("result", ""),
-        "session_id": result.get("session_id"),
-        "cost_usd": result.get("total_cost_usd"),
-        "duration_ms": result.get("duration_ms"),
-        "num_turns": result.get("num_turns"),
-        "usage": result.get("usage"),
+        "engine": engine.name,
+        "model": model,
+        "result": result.text,
+        "session_id": result.session_id,
+        "cost_usd": result.cost_usd,
+        "duration_ms": result.duration_ms,
+        "num_turns": result.num_turns,
+        "usage": result.usage,
     }
 
 
@@ -481,7 +465,9 @@ class TaskRequest(RunRequest):
 class ContinueRequest(BaseModel):
     prompt: str
     title: str | None = None
-    # Omitted fields are inherited from the parent task.
+    # Omitted fields are inherited from the parent task. The engine is always the
+    # parent's: a CLI session can only be continued by the CLI that created it.
+    engine: str | None = None
     model: str | None = None
     allowed_tools: str | None = None
     system_prompt: str | None = None
@@ -490,7 +476,8 @@ class ContinueRequest(BaseModel):
 @app.post("/v1/tasks", dependencies=[Depends(require_token)], status_code=202)
 async def tasks_create(req: TaskRequest):
     return create_task(
-        req.prompt, req.title, req.model, req.allowed_tools, req.subdir, req.session_id, req.system_prompt
+        req.engine, req.prompt, req.title, req.model, req.allowed_tools, req.subdir, req.session_id,
+        req.system_prompt,
     )
 
 
@@ -511,8 +498,9 @@ async def tasks_get(task_id: str):
     return task_out(load_task(task_id))
 
 
-def read_events(task_id: str, after: int, raw: bool, limit: int) -> tuple[list[dict], int]:
+def read_events(task: dict, after: int, raw: bool, limit: int) -> tuple[list[dict], int]:
     """Events from line `after` on; returns them and the line number to resume from."""
+    task_id, compact = task["id"], task_engine(task).compact
     items, seq = [], after
     try:
         with open(events_path(task_id), "rb") as f:
@@ -537,9 +525,9 @@ def read_events(task_id: str, after: int, raw: bool, limit: int) -> tuple[list[d
 
 @app.get("/v1/tasks/{task_id}/events", dependencies=[Depends(require_token)])
 async def tasks_events(task_id: str, after: int = 0, raw: bool = False, limit: int = 1000):
-    status = load_task(task_id)["status"]
-    events, next_seq = read_events(task_id, max(after, 0), raw, max(1, min(limit, 5000)))
-    return {"status": status, "events": events, "next": next_seq}
+    t = load_task(task_id)
+    events, next_seq = read_events(t, max(after, 0), raw, max(1, min(limit, 5000)))
+    return {"status": t["status"], "events": events, "next": next_seq}
 
 
 @app.get("/v1/tasks/{task_id}/stream", dependencies=[Depends(require_token)])
@@ -549,8 +537,9 @@ async def tasks_stream(task_id: str, after: int = 0, raw: bool = False):
     async def gen():
         seq, idle = max(after, 0), 0.0
         while True:
-            status = load_task(task_id)["status"]
-            events, seq = read_events(task_id, seq, raw, 1000)
+            t = load_task(task_id)
+            status = t["status"]
+            events, seq = read_events(t, seq, raw, 1000)
             for ev in events:
                 yield f"id: {ev['seq']}\ndata: {json.dumps(ev, ensure_ascii=False)}\n\n"
             if events:
@@ -588,7 +577,11 @@ async def tasks_continue(task_id: str, req: ContinueRequest):
         raise HTTPException(status_code=409, detail="task is still active; wait or cancel it first")
     if not parent["session_id"]:
         raise HTTPException(status_code=409, detail="task has no CLI session to continue")
+    engine = parent["engine"] or "claude"
+    if req.engine and req.engine != engine:
+        raise HTTPException(status_code=409, detail=f"this session belongs to {engine}; start a new task to switch engines")
     return create_task(
+        engine,
         req.prompt,
         req.title or parent["title"],
         req.model or parent["model"],
@@ -621,6 +614,7 @@ class ChatRequest(BaseModel):
     messages: list[ChatMessage]
     stream: bool = False
     # Non-standard extras, passed through e.g. via `extra_body` in the OpenAI SDK.
+    engine: str | None = None  # default: the engine that lists `model`, else ENGINE
     allowed_tools: str | None = None
     subdir: str | None = None
     session_id: str | None = None
@@ -655,10 +649,14 @@ async def chat_completions(req: ChatRequest):
             + "\n\nReply to the latest message:\n\n" + message_text(dialog[-1].content)
         )
 
-    result = await run_claude(
-        prompt, req.model, req.allowed_tools, req.subdir, req.session_id, system or None
+    engine_name = req.engine or next(
+        (name for name, e in ENGINES.items() if req.model and req.model in e.models()), None
     )
-    usage = result.get("usage") or {}
+    engine, model, result = await run_sync(
+        engine_name, prompt, req.model, req.allowed_tools, req.subdir, req.session_id, system or None
+    )
+    usage = result.usage or {}
+    # Claude counts cached input separately; Codex includes it in input_tokens.
     prompt_tokens = (
         usage.get("input_tokens", 0)
         + usage.get("cache_read_input_tokens", 0)
@@ -669,10 +667,10 @@ async def chat_completions(req: ChatRequest):
         "id": f"chatcmpl-{uuid.uuid4().hex}",
         "object": "chat.completion",
         "created": int(time.time()),
-        "model": req.model or DEFAULT_MODEL,
+        "model": model,
         "choices": [{
             "index": 0,
-            "message": {"role": "assistant", "content": result.get("result", "")},
+            "message": {"role": "assistant", "content": result.text},
             "finish_reason": "stop",
         }],
         "usage": {
@@ -680,7 +678,7 @@ async def chat_completions(req: ChatRequest):
             "completion_tokens": completion_tokens,
             "total_tokens": prompt_tokens + completion_tokens,
         },
-        "session_id": result.get("session_id"),
+        "session_id": result.session_id,
     }
 
 
@@ -688,5 +686,19 @@ async def chat_completions(req: ChatRequest):
 async def models():
     return {
         "object": "list",
-        "data": [{"id": m, "object": "model", "owned_by": "anthropic"} for m in ("sonnet", "opus", "haiku")],
+        "data": [
+            {"id": m, "object": "model", "owned_by": e.owner, "engine": e.name}
+            for e in ENGINES.values() if e.available() for m in e.models()
+        ],
+    }
+
+
+@app.get("/v1/engines", dependencies=[Depends(require_token)])
+async def engines():
+    return {
+        "default": DEFAULT_ENGINE,
+        "engines": [
+            {"name": e.name, "available": e.available(), "default_model": e.default_model, "models": e.models()}
+            for e in ENGINES.values()
+        ],
     }
