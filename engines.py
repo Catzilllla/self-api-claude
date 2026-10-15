@@ -25,6 +25,7 @@ from pathlib import Path
 CLAUDE_BIN = os.environ.get("CLAUDE_BIN", "claude")
 CODEX_BIN = os.environ.get("CODEX_BIN", "codex")
 CODEX_HOME = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex"))
+CLAUDE_HOME = Path(os.environ.get("CLAUDE_CONFIG_DIR", Path.home() / ".claude"))
 
 # Codex features that reach beyond the working directory: ChatGPT connectors
 # (they include their own web search), plugins, browser and desktop control.
@@ -72,6 +73,10 @@ class Engine:
 
     def session_id(self, ev: dict) -> str | None:
         """Session id, if this event announces it (saved early, so failed tasks can be continued)."""
+        raise NotImplementedError
+
+    def session_file(self, session_id: str) -> Path | None:
+        """The CLI's own transcript of a session (full history across all its tasks), if found."""
         raise NotImplementedError
 
     def compact(self, ev: dict) -> list[dict]:
@@ -136,6 +141,10 @@ class Claude(Engine):
         if ev.get("type") == "system" and ev.get("subtype") == "init":
             return ev.get("session_id")
         return None
+
+    def session_file(self, session_id):
+        # Stored per working directory: projects/<cwd with "/" and "." as "-">/<id>.jsonl
+        return next((CLAUDE_HOME / "projects").glob(f"*/{session_id}.jsonl"), None)
 
     def compact(self, ev):
         kind = ev.get("type")
@@ -277,6 +286,10 @@ class Codex(Engine):
 
     def session_id(self, ev):
         return ev.get("thread_id") if ev.get("type") == "thread.started" else None
+
+    def session_file(self, session_id):
+        # sessions/YYYY/MM/DD/rollout-<timestamp>-<id>.jsonl
+        return next((CODEX_HOME / "sessions").glob(f"*/*/*/rollout-*-{session_id}.jsonl"), None)
 
     def compact(self, ev):
         kind, item = ev.get("type"), ev.get("item") or {}

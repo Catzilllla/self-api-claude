@@ -170,11 +170,12 @@ curl -X DELETE -H "Authorization: Bearer $T" $U/v1/tasks/ID        # удали�
 | `title` | string | нет | Название для списка, только `/v1/tasks` |
 | `model` | string | нет | Claude: `sonnet`, `opus`, `haiku` или полный id, по умолчанию `DEFAULT_MODEL`. Codex: модель из `/v1/engines`, по умолчанию `CODEX_DEFAULT_MODEL` |
 | `allowed_tools` | string | нет | Инструменты через запятую, например `Bash,Read,Write`; `""` — только текст; по умолчанию `DEFAULT_TOOLS` |
-| `subdir` | string | нет | Рабочая папка внутри `WORKDIR`, символы `A-Z a-z 0-9 _ -`, до 64 |
+| `subdir` | string | нет | Рабочая папка внутри `WORKDIR`: до 8 вложенных папок через `/`, в имени каждой символы `A-Z a-z 0-9 _ -`, до 64, например `tg42/sessions/t7` |
+| `archive_dir` | string | нет | Только `/v1/tasks` и `/continue`. Папка внутри `WORKDIR` (те же правила, что у `subdir`), куда по завершении задачи копируются её логи: `tasks/<id>.events.jsonl`, `tasks/<id>.stderr.log`, `tasks/<id>.json` (объект задачи) и `sessions/<engine>-<session_id>.jsonl` — полный транскрипт сессии Claude Code или Codex. `/continue` наследует его от родителя |
 | `session_id` | string | нет | Продолжить существующую сессию CLI |
 | `system_prompt` | string | нет | Дополнительные инструкции: у Claude добавляются к системному промпту, у Codex идут как `developer_instructions` |
 
-Для `POST /v1/tasks/{id}/continue`: обязателен `prompt`, необязательны `title`, `model`, `allowed_tools` и `system_prompt`. Не указанные поля берутся из родительской задачи, `subdir` и `engine` всегда остаются её: сессию продолжает только тот CLI, который её создал. Другой `engine` в запросе даёт `409`.
+Для `POST /v1/tasks/{id}/continue`: обязателен `prompt`, необязательны `title`, `model`, `allowed_tools`, `system_prompt` и `archive_dir`. Не указанные поля берутся из родительской задачи, `subdir` и `engine` всегда остаются её: сессию продолжает только тот CLI, который её создал. Другой `engine` в запросе даёт `409`.
 
 Для `POST /v1/chat/completions`: стандартные `model` и `messages`, а также нестандартные `engine`, `allowed_tools`, `subdir` и `session_id`. Без `engine` движок выбирается по `model` (в OpenAI SDK передаются через `extra_body`). Сообщения `system` идут в системный промпт. Без `session_id` вся история склеивается в один промпт.
 
@@ -184,7 +185,7 @@ curl -X DELETE -H "Authorization: Bearer $T" $U/v1/tasks/ID        # удали�
 | --- | --- |
 | `id` | 32 hex-символа |
 | `status` | `queued`, `running`, `done`, `failed` или `cancelled` |
-| `title`, `engine`, `model`, `subdir` | Как в запросе; `model` — фактическая модель с учётом умолчания |
+| `title`, `engine`, `model`, `subdir`, `archive_dir` | Как в запросе; `model` — фактическая модель с учётом умолчания |
 | `parent_id` | `id` задачи, от которой сделан `/continue`, иначе `null` |
 | `session_id` | Сессия CLI; появляется в первые секунды работы |
 | `result` | Итоговый ответ агента (когда `done`) |
