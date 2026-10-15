@@ -21,10 +21,15 @@ Background tasks (survive client disconnects and service restarts):
   POST /v1/tasks/{id}/continue  — follow-up in the same CLI session (new task)
   DELETE /v1/tasks/{id}         — forget a finished task
 
+A task may name an archive_dir inside WORKDIR: when it ends, its event log,
+stderr, final state and the CLI's transcript of the whole session are copied
+there (tasks/<id>.*, sessions/<engine>-<session_id>.jsonl).
+
 Config via env:
   WRAPPER_TOKEN    required, Bearer token clients must send
   MAX_CONCURRENCY  parallel CLI processes, shared by runs and tasks (default 3)
-  WORKDIR          base dir; each request runs in WORKDIR/<subdir> (default ./work)
+  WORKDIR          base dir; each request runs in WORKDIR/<subdir> (default ./work);
+                   subdir may be nested, e.g. "tg42/sessions/t7"
   TASKS_DIR        task database and event logs, outside WORKDIR (default ./tasks)
   DEFAULT_TOOLS    tools when the request doesn't specify any ("" = text only)
   ENGINE           engine when the request doesn't name one (default "claude")
@@ -40,8 +45,10 @@ import asyncio
 import fcntl
 import hmac
 import json
+import logging
 import os
 import re
+import shutil
 import sqlite3
 import time
 import uuid
@@ -74,7 +81,8 @@ if DEFAULT_ENGINE not in ENGINES:
 WORKDIR.mkdir(parents=True, exist_ok=True)
 TASKS_DIR.mkdir(parents=True, exist_ok=True)
 
-SUBDIR_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+# Up to 8 nested folders; without "." no segment can climb out of WORKDIR.
+SUBDIR_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}(/[A-Za-z0-9_-]{1,64}){0,7}$")
 SESSION_RE = re.compile(r"^[A-Za-z0-9-]{1,64}$")
 TOOLS_RE = re.compile(r"^[A-Za-z0-9_,\s()*:./-]*$")
 MODEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._\[\]-]{0,63}$")
@@ -83,6 +91,7 @@ FLAG_IN_TOOLS_RE = re.compile(r"(^|[\s,])-")
 TASK_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 
 semaphore = asyncio.Semaphore(MAX_CONCURRENCY)
+log = logging.getLogger("uvicorn.error")
 
 
 def require_token(authorization: str = Header(default="")) -> None:
@@ -91,13 +100,13 @@ def require_token(authorization: str = Header(default="")) -> None:
         raise HTTPException(status_code=401, detail="invalid token")
 
 
-def resolve_cwd(subdir: str | None) -> Path:
+def resolve_cwd(subdir: str | None, field: str = "subdir") -> Path:
     if not subdir:
         return WORKDIR
     if not SUBDIR_RE.match(subdir):
-        raise HTTPException(status_code=400, detail="subdir must match [A-Za-z0-9_-]{1,64}")
+        raise HTTPException(status_code=400, detail=f"{field} must be folders of [A-Za-z0-9_-]{{1,64}} joined by /")
     path = WORKDIR / subdir
-    path.mkdir(exist_ok=True)
+    path.mkdir(parents=True, exist_ok=True)
     return path
 
 
@@ -207,8 +216,11 @@ db.execute("""
         finished_at REAL
     )
 """)
-if "engine" not in {r["name"] for r in db.execute("PRAGMA table_info(tasks)")}:
+columns = {r["name"] for r in db.execute("PRAGMA table_info(tasks)")}
+if "engine" not in columns:
     db.execute("ALTER TABLE tasks ADD COLUMN engine TEXT")  # older databases: those tasks ran on Claude
+if "archive_dir" not in columns:
+    db.execute("ALTER TABLE tasks ADD COLUMN archive_dir TEXT")
 
 ACTIVE = ("queued", "running")
 TERMINAL = ("done", "failed", "cancelled")
@@ -253,6 +265,7 @@ def task_out(t: dict, full: bool = True) -> dict:
         "engine": t["engine"] or "claude",
         "model": t["model"] or task_engine(t).default_model,
         "subdir": t["subdir"],
+        "archive_dir": t["archive_dir"],
         "parent_id": t["parent_id"],
         "session_id": t["session_id"],
         "cost_usd": t["cost_usd"],
@@ -281,6 +294,27 @@ def stderr_tail(task_id: str) -> str:
         return stderr_path(task_id).read_text(errors="replace")[-2000:].strip()
     except OSError:
         return ""
+
+
+def archive(task_id: str) -> None:
+    """Copy a finished task's logs and its CLI session transcript into WORKDIR/<archive_dir>."""
+    t = load_task(task_id)
+    if not t["archive_dir"]:
+        return
+    try:
+        root = resolve_cwd(t["archive_dir"], "archive_dir")
+        tasks = root / "tasks"
+        tasks.mkdir(exist_ok=True)
+        for src, name in ((events_path(task_id), f"{task_id}.events.jsonl"), (stderr_path(task_id), f"{task_id}.stderr.log")):
+            if src.exists():
+                shutil.copyfile(src, tasks / name)
+        (tasks / f"{task_id}.json").write_text(json.dumps(task_out(t), ensure_ascii=False, indent=2))
+        engine = task_engine(t)
+        if t["session_id"] and (src := engine.session_file(t["session_id"])):
+            (root / "sessions").mkdir(exist_ok=True)
+            shutil.copyfile(src, root / "sessions" / f"{engine.name}-{t['session_id']}.jsonl")
+    except Exception:  # an archive problem must never affect the task itself
+        log.exception("archiving task %s failed", task_id)
 
 
 async def run_task(task_id: str) -> None:
@@ -368,6 +402,8 @@ async def run_task(task_id: str) -> None:
     finally:
         running_procs.pop(task_id, None)
         task_handles.pop(task_id, None)
+        if load_task(task_id)["status"] in TERMINAL:
+            archive(task_id)
 
 
 def schedule(task_id: str) -> None:
@@ -384,16 +420,19 @@ def create_task(
     session_id: str | None,
     system_prompt: str | None,
     parent_id: str | None = None,
+    archive_dir: str | None = None,
 ) -> dict:
     engine = get_engine(engine_name)
     tools = DEFAULT_TOOLS if allowed_tools is None else allowed_tools
     check_params(model, tools, session_id)
     resolve_cwd(subdir)  # validate now, not in the background
+    resolve_cwd(archive_dir, "archive_dir")
     task_id = uuid.uuid4().hex
     db.execute(
         "INSERT INTO tasks (id, title, status, prompt, model, allowed_tools, subdir, system_prompt, engine,"
-        " parent_id, resume_session_id, created_at) VALUES (?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        (task_id, title, prompt, model, tools, subdir, system_prompt, engine.name, parent_id, session_id, time.time()),
+        " parent_id, resume_session_id, archive_dir, created_at) VALUES (?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (task_id, title, prompt, model, tools, subdir, system_prompt, engine.name, parent_id, session_id,
+         archive_dir, time.time()),
     )
     schedule(task_id)
     return task_out(load_task(task_id))
@@ -409,12 +448,15 @@ async def lifespan(_app: FastAPI):
     except BlockingIOError:
         raise RuntimeError(f"another instance is already using {TASKS_DIR}")
     # Processes of a previous run died with it: mark them, and restart what never began.
+    interrupted = [r["id"] for r in db.execute("SELECT id FROM tasks WHERE status = 'running'").fetchall()]
     db.execute(
         "UPDATE tasks SET status = 'failed', finished_at = ?,"
         " error = 'interrupted by server restart; use /continue to resume the session'"
         " WHERE status = 'running'",
         (time.time(),),
     )
+    for task_id in interrupted:
+        archive(task_id)
     for row in db.execute("SELECT id FROM tasks WHERE status = 'queued' ORDER BY created_at").fetchall():
         schedule(row["id"])
     yield
@@ -460,6 +502,7 @@ async def run(req: RunRequest):
 
 class TaskRequest(RunRequest):
     title: str | None = None
+    archive_dir: str | None = None  # where to copy logs when the task ends; inherited by /continue
 
 
 class ContinueRequest(BaseModel):
@@ -471,13 +514,14 @@ class ContinueRequest(BaseModel):
     model: str | None = None
     allowed_tools: str | None = None
     system_prompt: str | None = None
+    archive_dir: str | None = None
 
 
 @app.post("/v1/tasks", dependencies=[Depends(require_token)], status_code=202)
 async def tasks_create(req: TaskRequest):
     return create_task(
         req.engine, req.prompt, req.title, req.model, req.allowed_tools, req.subdir, req.session_id,
-        req.system_prompt,
+        req.system_prompt, archive_dir=req.archive_dir,
     )
 
 
@@ -590,6 +634,7 @@ async def tasks_continue(task_id: str, req: ContinueRequest):
         parent["session_id"],
         parent["system_prompt"] if req.system_prompt is None else req.system_prompt,
         parent_id=task_id,
+        archive_dir=req.archive_dir or parent["archive_dir"],
     )
 
 
